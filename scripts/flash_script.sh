@@ -87,6 +87,8 @@ if [ -d /system/addon.d ]; then
   chmod 755 $ADDOND
 fi
 
+touch /data/adb/magisk_module_check
+
 ##################
 # Image Patching
 ##################
