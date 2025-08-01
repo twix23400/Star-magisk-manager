@@ -1,333 +1,694 @@
-package com.topjohnwu.magisk.ui.settings
+package com.topjohnwu.magisk.core.tasks
 
-import android.content.Context
-import android.content.res.Resources
-import android.os.Build
-import android.view.LayoutInflater
-import android.view.View
-import androidx.databinding.Bindable
-import com.topjohnwu.magisk.BR
-import com.topjohnwu.magisk.R
+import android.net.Uri
+import android.os.Process
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import android.system.OsConstants.O_WRONLY
+import androidx.annotation.WorkerThread
+import androidx.core.os.postDelayed
+import com.topjohnwu.magisk.StubApk
+import com.topjohnwu.magisk.core.AppApkPath
 import com.topjohnwu.magisk.core.BuildConfig
 import com.topjohnwu.magisk.core.Config
 import com.topjohnwu.magisk.core.Const
 import com.topjohnwu.magisk.core.Info
-import com.topjohnwu.magisk.core.ktx.activity
-import com.topjohnwu.magisk.core.tasks.AppMigration
-import com.topjohnwu.magisk.core.utils.LocaleSetting
+import com.topjohnwu.magisk.core.di.ServiceLocator
+import com.topjohnwu.magisk.core.isRunningAsStub
+import com.topjohnwu.magisk.core.ktx.copyAll
+import com.topjohnwu.magisk.core.ktx.writeTo
+import com.topjohnwu.magisk.core.utils.DummyList
 import com.topjohnwu.magisk.core.utils.MediaStoreUtils
-import com.topjohnwu.magisk.databinding.DialogSettingsAppNameBinding
-import com.topjohnwu.magisk.databinding.DialogSettingsDownloadPathBinding
-import com.topjohnwu.magisk.databinding.DialogSettingsUpdateChannelBinding
-import com.topjohnwu.magisk.databinding.set
-import com.topjohnwu.magisk.utils.TextHolder
-import com.topjohnwu.magisk.utils.asText
-import com.topjohnwu.magisk.view.MagiskDialog
+import com.topjohnwu.magisk.core.utils.MediaStoreUtils.inputStream
+import com.topjohnwu.magisk.core.utils.MediaStoreUtils.outputStream
+import com.topjohnwu.magisk.core.utils.RootUtils
 import com.topjohnwu.superuser.Shell
-import com.topjohnwu.magisk.core.R as CoreR
+import com.topjohnwu.superuser.ShellUtils
+import com.topjohnwu.superuser.internal.UiThreadHandler
+import com.topjohnwu.superuser.nio.ExtendedFile
+import com.topjohnwu.superuser.nio.FileSystemManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
+import org.apache.commons.compress.archivers.zip.ZipFile
+import org.apache.commons.compress.compressors.lz4.FramedLZ4CompressorInputStream
+import timber.log.Timber
+import java.io.File
+import java.io.FilterInputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.PushbackInputStream
+import java.nio.ByteBuffer
+import java.security.SecureRandom
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
-// --- Customization
+abstract class MagiskInstallImpl protected constructor(
+    protected val console: MutableList<String>,
+    private val logs: MutableList<String>
+) {
 
-object Customization : BaseSettingsItem.Section() {
-    override val title = CoreR.string.settings_customization.asText()
-}
+    private lateinit var installDir: ExtendedFile
+    private lateinit var srcBoot: ExtendedFile
 
-object Language : BaseSettingsItem.Selector() {
-    private val names: Array<String> get() = LocaleSetting.available.names
-    private val tags: Array<String> get() = LocaleSetting.available.tags
+    private val shell = Shell.getShell()
+    private val useRootDir = shell.isRoot && Info.noDataExec
+    protected val context get() = ServiceLocator.deContext
 
-    override var value
-        get() = tags.indexOf(Config.locale)
-        set(value) {
-            Config.locale = tags[value]
+    private val rootFS get() = RootUtils.fs
+    private val localFS get() = FileSystemManager.getLocal()
+
+    private val destName: String by lazy {
+        if (Config.randName) {
+            val alpha = "abcdefghijklmnopqrstuvwxyz"
+            val alphaNum = "$alpha${alpha.uppercase(Locale.ROOT)}0123456789"
+            val random = SecureRandom()
+            StringBuilder("magisk_patched-${BuildConfig.APP_VERSION_CODE}_").run {
+                for (i in 1..5) {
+                    append(alphaNum[random.nextInt(alphaNum.length)])
+                }
+                toString()
+            }
+        } else {
+            "magisk_patched"
         }
+    }
 
-    override val title = CoreR.string.language.asText()
-
-    override fun entries(res: Resources) = names
-    override fun descriptions(res: Resources) = names
-}
-
-object LanguageSystem : BaseSettingsItem.Blank() {
-    override val title = CoreR.string.language.asText()
-    override val description: TextHolder
-        get() {
-            val locale = LocaleSetting.instance.appLocale
-            return locale?.getDisplayName(locale)?.asText() ?: CoreR.string.system_default.asText()
+    private fun findImage(slot: String): Boolean {
+        val bootPath = (
+            "(RECOVERYMODE=${Config.recovery} " +
+            "SLOT=$slot find_boot_image; " +
+            "echo \$BOOTIMAGE)").fsh()
+        if (bootPath.isEmpty()) {
+            console.add("! Не удалось определить целевой образ")
+            return false
         }
-}
+        srcBoot = rootFS.getFile(bootPath)
+        console.add("- Целевой образ: $bootPath")
+        return true
+    }
 
-object Theme : BaseSettingsItem.Blank() {
-    override val icon = R.drawable.ic_paint
-    override val title = CoreR.string.section_theme.asText()
-}
+    private fun findImage(): Boolean {
+        return findImage(Info.slot)
+    }
 
-// --- App
+    private fun findSecondary(): Boolean {
+        val slot = if (Info.slot == "_a") "_b" else "_a"
+        console.add("- Целевой слот: $slot")
+        return findImage(slot)
+    }
 
-object AppSettings : BaseSettingsItem.Section() {
-    override val title = CoreR.string.home_app_title.asText()
-}
+    private suspend fun extractFiles(): Boolean {
+        console.add("- Платформа устройства: ${Const.CPU_ABI}")
+        console.add("- Установка: ${BuildConfig.APP_VERSION_NAME} (${BuildConfig.APP_VERSION_CODE})")
 
-object Hide : BaseSettingsItem.Input() {
-    override val title = CoreR.string.settings_hide_app_title.asText()
-    override val description = CoreR.string.settings_hide_app_summary.asText()
-    override var value = ""
+        installDir = localFS.getFile(context.filesDir.parent, "install")
+        installDir.deleteRecursively()
+        installDir.mkdirs()
 
-    override val inputResult
-        get() = if (isError) null else result
+        try {
+            // Extract binaries
+            if (isRunningAsStub) {
+                ZipFile.builder().setFile(StubApk.current(context)).get().use { zf ->
+                    zf.entries.asSequence().filter {
+                        !it.isDirectory && it.name.startsWith("lib/${Const.CPU_ABI}/")
+                    }.forEach {
+                        val n = it.name.substring(it.name.lastIndexOf('/') + 1)
+                        val name = n.substring(3, n.length - 3)
+                        val dest = File(installDir, name)
+                        zf.getInputStream(it).writeTo(dest)
+                        dest.setExecutable(true)
+                    }
 
-    @get:Bindable
-    var result = "Settings"
-        set(value) = set(value, field, { field = it }, BR.result, BR.error)
-
-    val maxLength
-        get() = AppMigration.MAX_LABEL_LENGTH
-
-    @get:Bindable
-    val isError
-        get() = result.length > maxLength || result.isBlank()
-
-    override fun getView(context: Context) = DialogSettingsAppNameBinding
-        .inflate(LayoutInflater.from(context)).also { it.data = this }.root
-}
-
-object Restore : BaseSettingsItem.Blank() {
-    override val title = CoreR.string.settings_restore_app_title.asText()
-    override val description = CoreR.string.settings_restore_app_summary.asText()
-
-    override fun onPressed(view: View, handler: Handler) {
-        handler.onItemPressed(view, this) {
-            MagiskDialog(view.activity).apply {
-                setTitle(CoreR.string.settings_restore_app_title)
-                setMessage(CoreR.string.restore_app_confirmation)
-                setButton(MagiskDialog.ButtonType.POSITIVE) {
-                    text = android.R.string.ok
-                    onClick {
-                        handler.onItemAction(view, this@Restore)
+                    val abi32 = Const.CPU_ABI_32
+                    if (Process.is64Bit() && abi32 != null) {
+                        val entry = zf.getEntry("lib/$abi32/libmagisk.so")
+                        if (entry != null) {
+                            val magisk32 = File(installDir, "magisk32")
+                            zf.getInputStream(entry).writeTo(magisk32)
+                        }
                     }
                 }
-                setButton(MagiskDialog.ButtonType.NEGATIVE) {
-                    text = android.R.string.cancel
+            } else {
+                val info = context.applicationInfo
+                val libs = File(info.nativeLibraryDir).listFiles { _, name ->
+                    name.startsWith("lib") && name.endsWith(".so")
+                } ?: emptyArray()
+
+                for (lib in libs) {
+                    val name = lib.name.substring(3, lib.name.length - 3)
+                    Os.symlink(lib.path, "$installDir/$name")
                 }
-                setCancelable(true)
-                show()
+
+                // Also extract magisk32 on 64-bit devices that supports 32-bit
+                val abi32 = Const.CPU_ABI_32
+                if (Process.is64Bit() && abi32 != null) {
+                    val name = "lib/$abi32/libmagisk.so"
+                    val entry = javaClass.classLoader!!.getResourceAsStream(name)
+                    if (entry != null) {
+                        val magisk32 = File(installDir, "magisk32")
+                        entry.writeTo(magisk32)
+                    }
+                }
+            }
+
+            // Extract scripts
+            for (script in listOf("util_functions.sh", "boot_patch.sh", "addon.d.sh", "stub.apk")) {
+                val dest = File(installDir, script)
+                context.assets.open(script).writeTo(dest)
+            }
+            // Extract chromeos tools
+            File(installDir, "chromeos").mkdir()
+            for (file in listOf("futility", "kernel_data_key.vbprivk", "kernel.keyblock")) {
+                val name = "chromeos/$file"
+                val dest = File(installDir, name)
+                context.assets.open(name).writeTo(dest)
+            }
+        } catch (e: Exception) {
+            console.add("! Не удалось извлечь файлы")
+            Timber.e(e)
+            return false
+        }
+
+        if (useRootDir) {
+            // Move everything to tmpfs to workaround Samsung bullshit
+            rootFS.getFile(Const.TMPDIR).also {
+                arrayOf(
+                    "rm -rf $it",
+                    "mkdir -p $it",
+                    "cp_readlink $installDir $it",
+                    "rm -rf $installDir"
+                ).sh()
+                installDir = it
+            }
+        }
+
+        return true
+    }
+
+    private suspend fun InputStream.copyAndCloseOut(out: OutputStream) =
+        out.use { copyAll(it, 1024 * 1024) }
+
+    private class NoAvailableStream(s: InputStream) : FilterInputStream(s) {
+        // Make sure available is never called on the actual stream and always return 0
+        // to reduce max buffer size and avoid OOM
+        override fun available() = 0
+    }
+
+    private class NoBootException : IOException()
+
+    inner class BootItem(private val entry: TarArchiveEntry) {
+        val name = entry.name.replace(".lz4", "")
+        var file = installDir.getChildFile(name)
+
+        suspend fun copyTo(tarOut: TarArchiveOutputStream) {
+            entry.name = name
+            entry.size = file.length()
+            file.newInputStream().use {
+                console.add("-- Запись   : $name")
+                tarOut.putArchiveEntry(entry)
+                it.copyAll(tarOut)
+                tarOut.closeArchiveEntry()
             }
         }
     }
-}
 
-object AddShortcut : BaseSettingsItem.Blank() {
-    override val title = CoreR.string.add_shortcut_title.asText()
-    override val description = CoreR.string.setting_add_shortcut_summary.asText()
-}
+    @Throws(IOException::class)
+    private suspend fun processTar(
+        tarIn: TarArchiveInputStream,
+        tarOut: TarArchiveOutputStream
+    ): BootItem {
+        console.add("- Обработка tar файла")
+        var entry: TarArchiveEntry? = tarIn.nextEntry
 
-object DownloadPath : BaseSettingsItem.Input() {
-    override var value
-        get() = Config.downloadDir
-        set(value) {
-            Config.downloadDir = value
-            notifyPropertyChanged(BR.description)
+        fun decompressedStream(): InputStream {
+            val stream = if (tarIn.currentEntry.name.endsWith(".lz4"))
+                FramedLZ4CompressorInputStream(tarIn, true) else tarIn
+            return NoAvailableStream(stream)
         }
 
-    override val title = CoreR.string.settings_download_path_title.asText()
-    override val description get() = MediaStoreUtils.fullPath(value).asText()
+        var boot: BootItem? = null
+        var initBoot: BootItem? = null
+        var recovery: BootItem? = null
 
-    override var inputResult: String = value
-        set(value) = set(value, field, { field = it }, BR.inputResult, BR.path)
+        while (entry != null) {
+            val bootItem: BootItem?
+            if (entry.name.startsWith("boot.img")) {
+                bootItem = BootItem(entry)
+                boot = bootItem
+            } else if (entry.name.startsWith("init_boot.img")) {
+                bootItem = BootItem(entry)
+                initBoot = bootItem
+            } else if (Config.recovery && entry.name.contains("recovery.img")) {
+                bootItem = BootItem(entry)
+                recovery = bootItem
+            } else {
+                bootItem = null
+            }
 
-    @get:Bindable
-    val path get() = MediaStoreUtils.fullPath(inputResult)
+            if (bootItem != null) {
+                console.add("-- Извлечение: ${bootItem.name}")
+                decompressedStream().copyAndCloseOut(bootItem.file.newOutputStream())
+            } else if (entry.name.contains("vbmeta.img")) {
+                val rawData = decompressedStream().readBytes()
+                // Valid vbmeta.img should be at least 256 bytes
+                if (rawData.size < 256)
+                    continue
 
-    override fun getView(context: Context) = DialogSettingsDownloadPathBinding
-        .inflate(LayoutInflater.from(context)).also { it.data = this }.root
-}
+                // vbmeta partition exist, disable boot vbmeta patch
+                Info.patchBootVbmeta = false
 
-object UpdateChannel : BaseSettingsItem.Selector() {
-    override var value
-        get() = Config.updateChannel
-        set(value) {
-            Config.updateChannel = value
-            Info.resetUpdate()
+                val name = entry.name.replace(".lz4", "")
+                console.add("-- Патч  : $name")
+
+                // Patch flags to AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED |
+                // AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED
+                ByteBuffer.wrap(rawData).putInt(120, 3)
+
+                // Fetch the next entry first before modifying current entry
+                val vbmeta = entry
+                entry = tarIn.nextEntry
+
+                // Update entry with new information
+                vbmeta.name = name
+                vbmeta.size = rawData.size.toLong()
+
+                // Write output
+                tarOut.putArchiveEntry(vbmeta)
+                tarOut.write(rawData)
+                tarOut.closeArchiveEntry()
+                continue
+            } else if (entry.name.contains("userdata.img")) {
+                console.add("-- Пропуск  : ${entry.name}")
+            } else {
+                console.add("-- Копирование   : ${entry.name}")
+                tarOut.putArchiveEntry(entry)
+                tarIn.copyAll(tarOut)
+                tarOut.closeArchiveEntry()
+            }
+            entry = tarIn.nextEntry ?: break
         }
 
-    override val title = CoreR.string.settings_update_channel_title.asText()
-    override val entryRes = CoreR.array.update_channel
-}
-
-object UpdateChannelUrl : BaseSettingsItem.Input() {
-    override val title = CoreR.string.settings_update_custom.asText()
-    override val description get() = value.asText()
-    override var value
-        get() = Config.customChannelUrl
-        set(value) {
-            Config.customChannelUrl = value
-            Info.resetUpdate()
-            notifyPropertyChanged(BR.description)
+        // Patch priority: recovery > init_boot > boot
+        return when {
+            recovery != null -> {
+                if (boot != null) {
+                    // Repack boot image to prevent auto restore
+                    arrayOf(
+                        "cd $installDir",
+                        "chmod -R 755 .",
+                        "./magiskboot unpack boot.img",
+                        "./magiskboot repack boot.img",
+                        "cat new-boot.img > boot.img",
+                        "./magiskboot cleanup",
+                        "rm -f new-boot.img",
+                        "cd /").sh()
+                    boot.copyTo(tarOut)
+                }
+                recovery
+            }
+            initBoot != null -> {
+                boot?.copyTo(tarOut)
+                initBoot
+            }
+            boot != null -> boot
+            else -> throw NoBootException()
         }
-
-    override var inputResult: String = value
-        set(value) = set(value, field, { field = it }, BR.inputResult)
-
-    override fun refresh() {
-        isEnabled = UpdateChannel.value == Config.Value.CUSTOM_CHANNEL
     }
 
-    override fun getView(context: Context) = DialogSettingsUpdateChannelBinding
-        .inflate(LayoutInflater.from(context)).also { it.data = this }.root
-}
-
-object UpdateChecker : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_check_update_title.asText()
-    override val description = CoreR.string.settings_check_update_summary.asText()
-    override var value by Config::checkUpdate
-}
-
-object DoHToggle : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_doh_title.asText()
-    override val description = CoreR.string.settings_doh_description.asText()
-    override var value by Config::doh
-}
-
-object SystemlessHosts : BaseSettingsItem.Blank() {
-    override val title = CoreR.string.settings_hosts_title.asText()
-    override val description = CoreR.string.settings_hosts_summary.asText()
-}
-
-object RandNameToggle : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_random_name_title.asText()
-    override val description = CoreR.string.settings_random_name_description.asText()
-    override var value by Config::randName
-}
-
-// --- Magisk
-
-object Magisk : BaseSettingsItem.Section() {
-    override val title = CoreR.string.magisk.asText()
-}
-
-object Zygisk : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.zygisk.asText()
-    override val description get() =
-        if (mismatch) CoreR.string.reboot_apply_change.asText()
-        else CoreR.string.settings_zygisk_summary.asText()
-    override var value
-        get() = Config.zygisk
-        set(value) {
-            Config.zygisk = value
-            notifyPropertyChanged(BR.description)
+    @Throws(IOException::class)
+    private suspend fun processZip(zipIn: ZipArchiveInputStream): ExtendedFile {
+        console.add("- Обработка zip файла")
+        val boot = installDir.getChildFile("boot.img")
+        val initBoot = installDir.getChildFile("init_boot.img")
+        var entry: ZipArchiveEntry
+        while (true) {
+            entry = zipIn.nextEntry ?: break
+            if (entry.isDirectory) continue
+            when (entry.name.substringAfterLast('/')) {
+                "payload.bin" -> {
+                    try {
+                        return processPayload(zipIn)
+                    } catch (e: IOException) {
+                        // No boot image in payload.bin, continue to find boot images
+                    }
+                }
+                "init_boot.img" -> {
+                    console.add("- Извлечение init_boot.img")
+                    zipIn.copyAndCloseOut(initBoot.newOutputStream())
+                    return initBoot
+                }
+                "boot.img" -> {
+                    console.add("- Извлечение boot.img")
+                    zipIn.copyAndCloseOut(boot.newOutputStream())
+                    // Don't return here since there might be an init_boot.img
+                }
+            }
         }
-    val mismatch get() = value != Info.isZygiskEnabled
-}
+        if (boot.exists()) {
+            return boot
+        } else {
+            throw NoBootException()
+        }
+    }
 
-object DenyList : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_denylist_title.asText()
-    override val description get() = CoreR.string.settings_denylist_summary.asText()
+    @Throws(IOException::class)
+    private fun processPayload(input: InputStream): ExtendedFile {
+        var fifo: File? = null
+        try {
+            console.add("- Обработка payload.bin")
+            fifo = File.createTempFile("payload-fifo-", null, installDir)
+            fifo.delete()
+            Os.mkfifo(fifo.path, 420 /* 0644 */)
 
-    override var value = Config.denyList
-        set(value) {
-            field = value
-            val cmd = if (value) "enable" else "disable"
-            Shell.cmd("magisk --denylist $cmd").submit { result ->
-                if (result.isSuccess) {
-                    Config.denyList = value
+            // Enqueue the shell command first, or the subsequent FIFO open will block
+            val future = arrayOf(
+                "cd $installDir",
+                "./magiskboot extract $fifo",
+                "cd /"
+            ).eq()
+
+            val fd = Os.open(fifo.path, O_WRONLY, 0)
+            try {
+                val bufSize = 1024 * 1024
+                val buf = ByteBuffer.allocate(bufSize)
+                buf.position(input.read(buf.array()).coerceAtLeast(0)).flip()
+                while (buf.hasRemaining()) {
+                    try {
+                        Os.write(fd, buf)
+                    } catch (e: ErrnoException) {
+                        if (e.errno != OsConstants.EPIPE)
+                            throw e
+                        // If SIGPIPE, then the other side is closed, we're done
+                        break
+                    }
+                    if (!buf.hasRemaining()) {
+                        buf.limit(bufSize)
+                        buf.position(input.read(buf.array()).coerceAtLeast(0)).flip()
+                    }
+                }
+            } finally {
+                Os.close(fd)
+            }
+
+            val success = try { future.get().isSuccess } catch (e: Exception) { false }
+            if (!success) {
+                console.add("! Ошибка при извлечении payload.bin")
+                throw IOException()
+            }
+            val boot = installDir.getChildFile("boot.img")
+            val initBoot = installDir.getChildFile("init_boot.img")
+            return when {
+                initBoot.exists() -> {
+                    console.add("-- Извлечение init_boot.img")
+                    initBoot
+                }
+                boot.exists() -> {
+                    console.add("-- Извлечение boot.img")
+                    boot
+                }
+                else -> {
+                    throw NoBootException()
+                }
+            }
+        } catch (e: ErrnoException) {
+            throw IOException(e)
+        } finally {
+            fifo?.delete()
+        }
+    }
+
+    private suspend fun processFile(uri: Uri): Boolean {
+        val outStream: OutputStream
+        val outFile: MediaStoreUtils.UriFile
+        var bootItem: BootItem? = null
+
+        // Process input file
+        try {
+            PushbackInputStream(uri.inputStream().buffered(1024 * 1024), 512).use { src ->
+                val head = ByteArray(512)
+                if (src.read(head) != head.size) {
+                    console.add("! Неверный входной файл")
+                    return false
+                }
+                src.unread(head)
+
+                val magic = head.copyOf(4)
+                val tarMagic = head.copyOfRange(257, 262)
+
+                srcBoot = if (tarMagic.contentEquals("ustar".toByteArray())) {
+                    // tar file
+                    outFile = MediaStoreUtils.getFile("$destName.tar")
+                    val os = outFile.uri.outputStream().buffered(1024 * 1024)
+                    outStream = TarArchiveOutputStream(os).also {
+                        it.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_STAR)
+                        it.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU)
+                    }
+
+                    try {
+                        bootItem = processTar(TarArchiveInputStream(src), outStream)
+                        bootItem.file
+                    } catch (e: IOException) {
+                        outStream.close()
+                        outFile.delete()
+                        throw e
+                    }
                 } else {
-                    field = !value
-                    notifyPropertyChanged(BR.checked)
+                    // raw image
+                    outFile = MediaStoreUtils.getFile("$destName.img")
+                    outStream = outFile.uri.outputStream()
+
+                    try {
+                        if (magic.contentEquals("CrAU".toByteArray())) {
+                            processPayload(src)
+                        } else if (magic.contentEquals("PK\u0003\u0004".toByteArray())) {
+                            processZip(ZipArchiveInputStream(src))
+                        } else {
+                            console.add("- Копирование образа в кэш")
+                            installDir.getChildFile("boot.img").also {
+                                src.copyAndCloseOut(it.newOutputStream())
+                            }
+                        }
+                    } catch (e: IOException) {
+                        outStream.close()
+                        outFile.delete()
+                        throw e
+                    }
                 }
             }
+        } catch (e: IOException) {
+            if (e is NoBootException)
+                console.add("! Образ boot не найден")
+            console.add("! Ошибка обработки")
+            Timber.e(e)
+            return false
         }
-}
 
-object DenyListConfig : BaseSettingsItem.Blank() {
-    override val title = CoreR.string.settings_denylist_config_title.asText()
-    override val description = CoreR.string.settings_denylist_config_summary.asText()
-}
-
-// --- Superuser
-
-object Tapjack : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_su_tapjack_title.asText()
-    override val description = CoreR.string.settings_su_tapjack_summary.asText()
-    override var value by Config::suTapjack
-}
-
-object Authentication : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_su_auth_title.asText()
-    override var description = CoreR.string.settings_su_auth_summary.asText()
-    override var value by Config::suAuth
-
-    override fun refresh() {
-        isEnabled = Info.isDeviceSecure
-        if (!isEnabled) {
-            description = CoreR.string.settings_su_auth_insecure.asText()
+        // Patch file
+        if (!patchBoot()) {
+            outFile.delete()
+            return false
         }
+
+        // Output file
+        try {
+            val newBoot = installDir.getChildFile("new-boot.img")
+            if (bootItem != null) {
+                bootItem.file = newBoot
+                bootItem.copyTo(outStream as TarArchiveOutputStream)
+            } else {
+                newBoot.newInputStream().use { it.copyAll(outStream, 1024 * 1024) }
+            }
+            newBoot.delete()
+
+            console.add("")
+            console.add("****************************")
+            console.add(" Выходной файл записан в ")
+            console.add(" $outFile ")
+            console.add("****************************")
+        } catch (e: IOException) {
+            console.add("! Не удалось записать в $outFile")
+            outFile.delete()
+            Timber.e(e)
+            return false
+        } finally {
+            outStream.close()
+        }
+
+        // Fix up binaries
+        srcBoot.delete()
+        "cp_readlink $installDir".sh()
+
+        return true
+    }
+
+    private fun patchBoot(): Boolean {
+        val newBoot = installDir.getChildFile("new-boot.img")
+        if (!useRootDir) {
+            // Create output files before hand
+            newBoot.createNewFile()
+            File(installDir, "stock_boot.img").createNewFile()
+        }
+
+        val cmds = arrayOf(
+            "cd $installDir",
+            "KEEPFORCEENCRYPT=${Config.keepEnc} " +
+            "KEEPVERITY=${Config.keepVerity} " +
+            "PATCHVBMETAFLAG=${Info.patchBootVbmeta} " +
+            "RECOVERYMODE=${Config.recovery} " +
+            "LEGACYSAR=${Info.legacySAR} " +
+            "sh boot_patch.sh $srcBoot")
+        val isSuccess = cmds.sh().isSuccess
+
+        shell.newJob().add("./magiskboot cleanup", "cd /").exec()
+
+        return isSuccess
+    }
+
+    private fun flashBoot() = "direct_install $installDir $srcBoot".sh().isSuccess
+
+    private suspend fun postOTA(): Boolean {
+        try {
+            val bootctl = File.createTempFile("bootctl", null, context.cacheDir)
+            context.assets.open("bootctl").writeTo(bootctl)
+            "post_ota $bootctl".sh()
+        } catch (e: IOException) {
+            console.add("! Не удалось загрузить bootctl")
+            Timber.e(e)
+            return false
+        }
+
+        console.add("*************************************************************")
+        console.add(" Следующая перезагрузка загрузит второй слот!")
+        console.add(" Вернитесь в Обновления системы и нажмите Перезагрузка для завершения OTA")
+        console.add("*************************************************************")
+        return true
+    }
+
+    private fun Array<String>.eq() = shell.newJob().add(*this).to(console, logs).enqueue()
+    private fun String.sh() = shell.newJob().add(this).to(console, logs).exec()
+    private fun Array<String>.sh() = shell.newJob().add(*this).to(console, logs).exec()
+    private fun String.fsh() = ShellUtils.fastCmd(shell, this)
+    private fun Array<String>.fsh() = ShellUtils.fastCmd(shell, *this)
+
+    protected suspend fun patchFile(file: Uri) = extractFiles() && processFile(file)
+
+    protected suspend fun direct() = findImage() && extractFiles() && patchBoot() && flashBoot()
+
+    protected suspend fun secondSlot() =
+        findSecondary() && extractFiles() && patchBoot() && flashBoot() && postOTA()
+
+    protected suspend fun fixEnv() = extractFiles() && "fix_env $installDir".sh().isSuccess
+
+    protected fun restore() = findImage() && "restore_imgs $srcBoot".sh().isSuccess
+
+    protected fun uninstall() = "run_uninstaller $AppApkPath".sh().isSuccess
+
+    @WorkerThread
+    protected abstract suspend fun operations(): Boolean
+
+    open suspend fun exec(): Boolean {
+        if (haveActiveSession.getAndSet(true))
+            return false
+
+        val result = withContext(Dispatchers.IO) { operations() }
+        haveActiveSession.set(false)
+        if (result)
+            return true
+
+        // Not every operation initializes installDir
+        if (::installDir.isInitialized)
+            Shell.cmd("rm -rf $installDir").submit()
+        return false
+    }
+
+    companion object {
+        private var haveActiveSession = AtomicBoolean(false)
     }
 }
 
-object Superuser : BaseSettingsItem.Section() {
-    override val title = CoreR.string.superuser.asText()
-}
-
-object AccessMode : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.superuser_access.asText()
-    override val entryRes = CoreR.array.su_access
-    override var value by Config::rootMode
-}
-
-object MultiuserMode : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.multiuser_mode.asText()
-    override val entryRes = CoreR.array.multiuser_mode
-    override val descriptionRes = CoreR.array.multiuser_summary
-    override var value by Config::suMultiuserMode
-
-    override fun refresh() {
-        isEnabled = Const.USER_ID == 0
-    }
-}
-
-object MountNamespaceMode : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.mount_namespace_mode.asText()
-    override val entryRes = CoreR.array.namespace
-    override val descriptionRes = CoreR.array.namespace_summary
-    override var value by Config::suMntNamespaceMode
-}
-
-object AutomaticResponse : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.auto_response.asText()
-    override val entryRes = CoreR.array.auto_response
-    override var value by Config::suAutoResponse
-}
-
-object RequestTimeout : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.request_timeout.asText()
-    override val entryRes = CoreR.array.request_timeout
-
-    private val entryValues = listOf(10, 15, 20, 30, 45, 60)
-    override var value = entryValues.indexOfFirst { it == Config.suDefaultTimeout }
-        set(value) {
-            field = value
-            Config.suDefaultTimeout = entryValues[value]
+abstract class ConsoleInstaller(
+    console: MutableList<String>,
+    logs: MutableList<String>
+) : MagiskInstallImpl(console, logs) {
+    override suspend fun exec(): Boolean {
+        val success = super.exec()
+        if (success) {
+            console.add("- Все готово!")
+        } else {
+            console.add("! Ошибка установки")
         }
-}
-
-object SUNotification : BaseSettingsItem.Selector() {
-    override val title = CoreR.string.superuser_notification.asText()
-    override val entryRes = CoreR.array.su_notification
-    override var value by Config::suNotification
-}
-
-object Reauthenticate : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_su_reauth_title.asText()
-    override val description = CoreR.string.settings_su_reauth_summary.asText()
-    override var value by Config::suReAuth
-
-    override fun refresh() {
-        isEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+        return success
     }
 }
 
-object Restrict : BaseSettingsItem.Toggle() {
-    override val title = CoreR.string.settings_su_restrict_title.asText()
-    override val description = CoreR.string.settings_su_restrict_summary.asText()
-    override var value by Config::suRestrict
+abstract class CallBackInstaller : MagiskInstallImpl(DummyList, DummyList) {
+    suspend fun exec(callback: (Boolean) -> Unit): Boolean {
+        val success = exec()
+        callback(success)
+        return success
+    }
+}
+
+class MagiskInstaller {
+
+    class Patch(
+        private val uri: Uri,
+        console: MutableList<String>,
+        logs: MutableList<String>
+    ) : ConsoleInstaller(console, logs) {
+        override suspend fun operations() = patchFile(uri)
+    }
+
+    class SecondSlot(
+        console: MutableList<String>,
+        logs: MutableList<String>
+    ) : ConsoleInstaller(console, logs) {
+        override suspend fun operations() = secondSlot()
+    }
+
+    class Direct(
+        console: MutableList<String>,
+        logs: MutableList<String>
+    ) : ConsoleInstaller(console, logs) {
+        override suspend fun operations() = direct()
+    }
+
+    class Emulator(
+        console: MutableList<String>,
+        logs: MutableList<String>
+    ) : ConsoleInstaller(console, logs) {
+        override suspend fun operations() = fixEnv()
+    }
+
+    class Uninstall(
+        console: MutableList<String>,
+        logs: MutableList<String>
+    ) : ConsoleInstaller(console, logs) {
+        override suspend fun operations() = uninstall()
+
+        override suspend fun exec(): Boolean {
+            val success = super.exec()
+            if (success) {
+                UiThreadHandler.handler.postDelayed(3000) {
+                    Shell.cmd("pm uninstall ${context.packageName}").exec()
+                }
+            }
+            return success
+        }
+    }
+
+    class Restore : CallBackInstaller() {
+        override suspend fun operations() = restore()
+    }
+
+    class FixEnv : CallBackInstaller() {
+        override suspend fun operations() = fixEnv()
+    }
 }
