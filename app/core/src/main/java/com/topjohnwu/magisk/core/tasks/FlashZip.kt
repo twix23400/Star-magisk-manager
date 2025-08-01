@@ -33,13 +33,13 @@ open class FlashZip(
             mUri.toFile()
         } else {
             File(installDir, "install.zip").also {
-                console.add("- Copying zip to temp directory")
+                console.add("- Копирование zip во временную директорию")
                 try {
                     mUri.inputStream().writeTo(it)
                 } catch (e: IOException) {
                     when (e) {
-                        is FileNotFoundException -> console.add("! Invalid Uri")
-                        else -> console.add("! Cannot copy to cache")
+                        is FileNotFoundException -> console.add("! Неверный Uri")
+                        else -> console.add("! Невозможно скопировать в кэш")
                     }
                     throw e
                 }
@@ -50,11 +50,11 @@ open class FlashZip(
             val binary = File(installDir, "update-binary")
             AppContext.assets.open("module_installer.sh").use { it.writeTo(binary) }
         } catch (e: IOException) {
-            console.add("! Unzip error")
+            console.add("! Ошибка распаковки")
             throw e
         }
 
-        console.add("- Installing ${mUri.displayName}")
+        console.add("- Установка ${mUri.displayName}")
 
         return Shell.cmd("sh $installDir/update-binary dummy 1 \'$zipFile\'")
             .to(console, logs).exec().isSuccess
@@ -63,7 +63,7 @@ open class FlashZip(
     open suspend fun exec() = withContext(Dispatchers.IO) {
         try {
             if (!flash()) {
-                console.add("! Installation failed")
+                console.add("! Ошибка установки")
                 false
             } else {
                 true
