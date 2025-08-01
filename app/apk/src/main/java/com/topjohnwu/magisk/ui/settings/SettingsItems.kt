@@ -284,7 +284,8 @@ object DenyList : BaseSettingsItem.Toggle() {
         }
 }
 
-SettingItem.Switch(
+
+object ModuleCheckToggle : SettingItem.Switch(
     title = "Проверка модулей на вредоносность",
     summary = "Отключение может быть небезопасным",
     key = "pref_check_modules",
@@ -306,6 +307,7 @@ SettingItem.Switch(
         }
     }
 )
+
 
 
 object DenyListConfig : BaseSettingsItem.Blank() {
