@@ -67,27 +67,7 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
         }.start()
     }
 
-    dialog.setCancelable(false)
-    dialog.show()
-}
- 
-        object : android.os.CountDownTimer(10000, 1000) {
-            override fun onTick(ms: Long) {
-                val sec = ms / 1000 + 1
-                button.text = "Да ($sec)"
-            }
-
-            override fun onFinish() {
-                button.text = "Да"
-                button.isEnabled = true
-                button.setOnClickListener {
-                    onResult(true)
-                    dialog.dismiss()
-                }
-            }
-        }.start()
-    }
-
+    
     dialog.setCancelable(false)
     dialog.show()
 }
