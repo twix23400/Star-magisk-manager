@@ -42,19 +42,35 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
             text = "Нет"
             onClick { onResult(false); dismiss() }
         }
-    }
-
-    dialog.setButton(MagiskDialog.ButtonType.POSITIVE) {
-        text = "Да (10)"
-        isEnabled = false
+        setButton(MagiskDialog.ButtonType.POSITIVE) {
+            text = "Да (10)"
+            isEnabled = false
+        }
     }
 
     dialog.setOnShowListener {
-        var positiveButton: Button? = null
-dialog.setOnShowListener {
-    positiveButton = (dialog as AlertDialog).getButton(AlertDialog.BUTTON_POSITIVE)
-    ...
-} 
+        val positiveButton = dialog.alertDialog?.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE)
+        object : android.os.CountDownTimer(10000, 1000) {
+            override fun onTick(ms: Long) {
+                val sec = ms / 1000 + 1
+                positiveButton?.text = "Да ($sec)"
+            }
+
+            override fun onFinish() {
+                positiveButton?.text = "Да"
+                positiveButton?.isEnabled = true
+                positiveButton?.setOnClickListener {
+                    onResult(true)
+                    dialog.dismiss()
+                }
+            }
+        }.start()
+    }
+
+    dialog.setCancelable(false)
+    dialog.show()
+}
+ 
         object : android.os.CountDownTimer(10000, 1000) {
             override fun onTick(ms: Long) {
                 val sec = ms / 1000 + 1
