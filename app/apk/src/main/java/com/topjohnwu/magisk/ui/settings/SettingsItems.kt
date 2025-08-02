@@ -143,7 +143,7 @@ object Restore : BaseSettingsItem.Blank() {
 
     override fun onPressed(view: View, handler: Handler) {
         handler.onItemPressed(view, this) {
-            MagiskDialog(view.activity).apply {
+            MagiskDialog(view.context as Activity).apply {
                 setTitle(CoreR.string.settings_restore_app_title)
                 setMessage(CoreR.string.restore_app_confirmation)
                 setButton(MagiskDialog.ButtonType.POSITIVE) {
