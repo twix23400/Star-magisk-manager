@@ -25,6 +25,8 @@ import com.topjohnwu.magisk.utils.asText
 import com.topjohnwu.magisk.view.MagiskDialog
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.magisk.core.R as CoreR
+import android.app.Activity
+import androidx.appcompat.app.AlertDialog
 
 fun enableShellCheck() {
     Shell.cmd("touch /data/adb/magisk_module_check").exec()
@@ -32,6 +34,32 @@ fun enableShellCheck() {
 
 fun disableShellCheck() {
     Shell.cmd("rm -f /data/adb/magisk_module_check").exec()
+}
+
+object ModuleCheckToggle : BaseSettingsItem.Toggle() {
+    override val title = "Проверка модулей на вредоносность".asText()
+    override val description = "Отключение может быть небезопасным".asText()
+    override var value: Boolean
+        get() = Config.checkModules
+        set(v) {
+            if (!v) {
+                showDangerousDisableDialog(context = currentActivityOrContext()) { confirmed ->
+                    if (confirmed) {
+                        disableShellCheck()
+                        Config.checkModules = false
+                        notifyPropertyChanged(BR.checked)
+                    }
+                }
+            } else {
+                enableShellCheck()
+                Config.checkModules = true
+                notifyPropertyChanged(BR.checked)
+            }
+        }
+
+    private fun currentActivityOrContext(): Context {
+        return Info.getTopActivity() ?: throw IllegalStateException("No active context found.")
+    }
 }
 
 fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
@@ -49,7 +77,8 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
     }
 
     dialog.setOnShowListener {
-        val positiveButton = dialog.alertDialog?.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE)
+        val alert = dialog.dialog as? AlertDialog
+        val positiveButton = alert?.getButton(AlertDialog.BUTTON_POSITIVE)
         object : android.os.CountDownTimer(10000, 1000) {
             override fun onTick(ms: Long) {
                 val sec = ms / 1000 + 1
@@ -67,10 +96,10 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
         }.start()
     }
 
-    
     dialog.setCancelable(false)
     dialog.show()
 }
+
 
 // --- Customization
 
