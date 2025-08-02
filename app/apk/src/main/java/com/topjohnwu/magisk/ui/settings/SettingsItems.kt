@@ -1,10 +1,15 @@
+@file:Suppress("SpellCheckingInspection")
+
 package com.topjohnwu.magisk.ui.settings
 
+import android.app.Activity
 import android.content.Context
 import android.content.res.Resources
 import android.os.Build
+import android.os.CountDownTimer
 import android.view.LayoutInflater
 import android.view.View
+import androidx.appcompat.app.AlertDialog
 import androidx.databinding.Bindable
 import com.topjohnwu.magisk.BR
 import com.topjohnwu.magisk.R
@@ -16,111 +21,67 @@ import com.topjohnwu.magisk.core.ktx.activity
 import com.topjohnwu.magisk.core.tasks.AppMigration
 import com.topjohnwu.magisk.core.utils.LocaleSetting
 import com.topjohnwu.magisk.core.utils.MediaStoreUtils
-import com.topjohnwu.magisk.databinding.DialogSettingsAppNameBinding
-import com.topjohnwu.magisk.databinding.DialogSettingsDownloadPathBinding
-import com.topjohnwu.magisk.databinding.DialogSettingsUpdateChannelBinding
-import com.topjohnwu.magisk.databinding.set
+import com.topjohnwu.magisk.databinding.*
 import com.topjohnwu.magisk.utils.TextHolder
 import com.topjohnwu.magisk.utils.asText
 import com.topjohnwu.magisk.view.MagiskDialog
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.magisk.core.R as CoreR
-import android.app.Activity
-import androidx.appcompat.app.AlertDialog
-import android.os.CountDownTimer
 
-import android.app.Activity
-import android.content.Context
-import android.os.CountDownTimer
-import androidx.appcompat.app.AlertDialog
-import com.topjohnwu.magisk.view.MagiskDialog
-import com.topjohnwu.superuser.Shell
-import com.topjohnwu.magisk.BR
-import com.topjohnwu.magisk.core.Config
-import com.topjohnwu.magisk.utils.asText
-
-fun enableShellCheck() {
-    Shell.cmd("touch /data/adb/magisk_module_check").exec()
-}
-
-fun disableShellCheck() {
-    Shell.cmd("rm -f /data/adb/magisk_module_check").exec()
-}
-
-fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
-    val dialog = MagiskDialog(context).apply {
-        setTitle("Предупреждение")
-        setMessage("Отключение проверки модулей может быть небезопасным. Продолжить?")
-        setButton(MagiskDialog.ButtonType.NEGATIVE) {
-            text = "Нет"
-            onClick { onResult(false); dismiss() }
-        }
-        setButton(MagiskDialog.ButtonType.POSITIVE) {
-            text = "Да (10)"
-            isEnabled = false
-        }
-        setCancelable(false)
-    }
-
-    dialog.setOnShowListener {
-        val activity = context as Activity
-        val alert = dialog.dialog as AlertDialog
-        val positiveButton = alert.getButton(AlertDialog.BUTTON_POSITIVE)
-
-        object : CountDownTimer(10000, 1000) {
-            override fun onTick(ms: Long) {
-                val sec = ms / 1000 + 1
-                positiveButton.text = "Да ($sec)"
-            }
-
-            override fun onFinish() {
-                positiveButton.text = "Да"
-                positiveButton.isEnabled = true
-                positiveButton.setOnClickListener {
-                    onResult(true)
-                    dialog.dismiss()
-                }
-            }
-        }.start()
-    }
-
-    dialog.show()
-}
+fun enableShellCheck() = Shell.cmd("touch /data/adb/magisk_module_check").exec()
+fun disableShellCheck() = Shell.cmd("rm -f /data/adb/magisk_module_check").exec()
 
 object ModuleCheckToggle : BaseSettingsItem.Toggle() {
+
     override val title = "Проверка модулей на вредоносность".asText()
     override val description = "Отключение может быть небезопасным".asText()
 
     override var value: Boolean
         get() = Config.checkModules
-        set(v) {
-            if (!v) {
-                showDangerousDisableDialog(currentActivity(), confirmed@{ confirmed ->
-                    if (confirmed) {
-                        disableShellCheck()
-                        Config.checkModules = false
-                        notifyPropertyChanged(BR.checked)
+        set(_) = throw IllegalStateException(
+            "Нельзя устанавливать значение напрямую — используйте onPressed()"
+        )
+
+    override fun onPressed(view: View, handler: Handler) {
+        val ctx = view.activity ?: view.context
+        if (Config.checkModules) {
+            MagiskDialog(ctx).apply {
+                setTitle("Предупреждение")
+                setMessage("Отключение проверки модулей может быть небезопасным. Продолжить?")
+                setButton(ButtonType.POSITIVE) {
+                    text = android.R.string.ok
+                    onClick {
+                        handler.onItemAction(view, this@ModuleCheckToggle)
                     }
-                })
-            } else {
-                enableShellCheck()
-                Config.checkModules = true
-                notifyPropertyChanged(BR.checked)
+                }
+                setButton(ButtonType.NEGATIVE) {
+                    text = android.R.string.cancel
+                }
+                setOnShowListener { dlg ->
+                    val alert = dlg as? AlertDialog
+                    val positive = alert?.getButton(AlertDialog.BUTTON_POSITIVE)
+                    positive?.isEnabled = false
+                    object : CountDownTimer(10_000, 1_000) {
+                        override fun onTick(ms: Long) {
+                            positive?.text = "(${ms / 1_000 + 1})"
+                        }
+                        override fun onFinish() {
+                            positive?.apply {
+                                text = ctx.getString(android.R.string.ok)
+                                isEnabled = true
+                            }
+                        }
+                    }.start()
+                }
+                setCancelable(false)
+                show()
             }
+        } else {
+            handler.onItemAction(view, this@ModuleCheckToggle)
         }
+    }
 }
 
-fun currentActivity(): Activity {
-    return com.topjohnwu.magisk.core.ktx.ActivityUtils.getActivity()
-}
-
-
-
-// --- Customization
-
-object Customization : BaseSettingsItem.Section() {
-    override val title = CoreR.string.settings_customization.asText()
-}
 
 object Language : BaseSettingsItem.Selector() {
     private val names: Array<String> get() = LocaleSetting.available.names
