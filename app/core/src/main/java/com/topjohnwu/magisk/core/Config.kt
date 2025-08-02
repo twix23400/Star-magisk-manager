@@ -116,6 +116,7 @@ object Config : PreferenceConfig, DBConfig {
     var customChannelUrl by preference(Key.CUSTOM_CHANNEL, "")
     var downloadDir by preference(Key.DOWNLOAD_DIR, "")
     var randName by preference(Key.RAND_NAME, true)
+    var checkModules by preference(Key.CHECK_MODULES, true)
     var checkUpdate
         get() = checkUpdatePrefs
         set(value) {
