@@ -27,6 +27,17 @@ import com.topjohnwu.superuser.Shell
 import com.topjohnwu.magisk.core.R as CoreR
 import android.app.Activity
 import androidx.appcompat.app.AlertDialog
+import android.os.CountDownTimer
+
+import android.app.Activity
+import android.content.Context
+import android.os.CountDownTimer
+import androidx.appcompat.app.AlertDialog
+import com.topjohnwu.magisk.view.MagiskDialog
+import com.topjohnwu.superuser.Shell
+import com.topjohnwu.magisk.BR
+import com.topjohnwu.magisk.core.Config
+import com.topjohnwu.magisk.utils.asText
 
 fun enableShellCheck() {
     Shell.cmd("touch /data/adb/magisk_module_check").exec()
@@ -34,32 +45,6 @@ fun enableShellCheck() {
 
 fun disableShellCheck() {
     Shell.cmd("rm -f /data/adb/magisk_module_check").exec()
-}
-
-object ModuleCheckToggle : BaseSettingsItem.Toggle() {
-    override val title = "Проверка модулей на вредоносность".asText()
-    override val description = "Отключение может быть небезопасным".asText()
-    override var value: Boolean
-        get() = Config.checkModules
-        set(v) {
-            if (!v) {
-                showDangerousDisableDialog(context = currentActivityOrContext()) { confirmed ->
-                    if (confirmed) {
-                        disableShellCheck()
-                        Config.checkModules = false
-                        notifyPropertyChanged(BR.checked)
-                    }
-                }
-            } else {
-                enableShellCheck()
-                Config.checkModules = true
-                notifyPropertyChanged(BR.checked)
-            }
-        }
-
-    private fun currentActivityOrContext(): Context {
-        return Info.getTopActivity() ?: throw IllegalStateException("No active context found.")
-    }
 }
 
 fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
@@ -74,21 +59,24 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
             text = "Да (10)"
             isEnabled = false
         }
+        setCancelable(false)
     }
 
     dialog.setOnShowListener {
-        val alert = dialog.dialog as? AlertDialog
-        val positiveButton = alert?.getButton(AlertDialog.BUTTON_POSITIVE)
-        object : android.os.CountDownTimer(10000, 1000) {
+        val activity = context as Activity
+        val alert = dialog.dialog as AlertDialog
+        val positiveButton = alert.getButton(AlertDialog.BUTTON_POSITIVE)
+
+        object : CountDownTimer(10000, 1000) {
             override fun onTick(ms: Long) {
                 val sec = ms / 1000 + 1
-                positiveButton?.text = "Да ($sec)"
+                positiveButton.text = "Да ($sec)"
             }
 
             override fun onFinish() {
-                positiveButton?.text = "Да"
-                positiveButton?.isEnabled = true
-                positiveButton?.setOnClickListener {
+                positiveButton.text = "Да"
+                positiveButton.isEnabled = true
+                positiveButton.setOnClickListener {
                     onResult(true)
                     dialog.dismiss()
                 }
@@ -96,9 +84,36 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
         }.start()
     }
 
-    dialog.setCancelable(false)
     dialog.show()
 }
+
+object ModuleCheckToggle : BaseSettingsItem.Toggle() {
+    override val title = "Проверка модулей на вредоносность".asText()
+    override val description = "Отключение может быть небезопасным".asText()
+
+    override var value: Boolean
+        get() = Config.checkModules
+        set(v) {
+            if (!v) {
+                showDangerousDisableDialog(currentActivity(), confirmed@{ confirmed ->
+                    if (confirmed) {
+                        disableShellCheck()
+                        Config.checkModules = false
+                        notifyPropertyChanged(BR.checked)
+                    }
+                })
+            } else {
+                enableShellCheck()
+                Config.checkModules = true
+                notifyPropertyChanged(BR.checked)
+            }
+        }
+}
+
+fun currentActivity(): Activity {
+    return com.topjohnwu.magisk.core.ktx.ActivityUtils.getActivity()
+}
+
 
 
 // --- Customization
