@@ -25,6 +25,7 @@ object Config : PreferenceConfig, DBConfig {
         const val BOOTLOOP = "bootloop"
         const val SU_MANAGER = "requester"
         const val KEYSTORE = "keystore"
+        const val CHECK_MODULES = "check_modules"
 
         // prefs
         const val SU_REQUEST_TIMEOUT = "su_request_timeout"
