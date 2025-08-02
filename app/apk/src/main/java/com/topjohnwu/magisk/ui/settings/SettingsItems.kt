@@ -50,7 +50,11 @@ fun showDangerousDisableDialog(context: Context, onResult: (Boolean) -> Unit) {
     }
 
     dialog.setOnShowListener {
-        val button = dialog.getButton(MagiskDialog.ButtonType.POSITIVE)
+        var positiveButton: Button? = null
+dialog.setOnShowListener {
+    positiveButton = (dialog as AlertDialog).getButton(AlertDialog.BUTTON_POSITIVE)
+    ...
+} 
         object : android.os.CountDownTimer(10000, 1000) {
             override fun onTick(ms: Long) {
                 val sec = ms / 1000 + 1
@@ -285,28 +289,27 @@ object DenyList : BaseSettingsItem.Toggle() {
 }
 
 
-object ModuleCheckToggle : SettingItem.Switch(
-    title = "Проверка модулей на вредоносность",
-    summary = "Отключение может быть небезопасным",
-    key = "pref_check_modules",
-    defaultValue = true,
-    onChange = { context, pref, value ->
-        if (!value) {
-            showDangerousDisableDialog(context) { confirmed ->
-                if (confirmed) {
-                    pref.isChecked = false
-                    disableShellCheck()
-                } else {
-                    pref.isChecked = true
-                }
+object ModuleCheckToggle : BaseSettingsItem.Toggle() {
+    override val title = "Проверка модулей на вредоносность".asText()
+    override val description = "Отключение может быть небезопасным".asText()
+    override var value: Boolean
+        get() = Config.checkModules
+        set(v) {
+            if (!v) {
+                showDangerousDisableDialog(AppContext.get(), confirmed@{ confirmed ->
+                    if (confirmed) {
+                        disableShellCheck()
+                        Config.checkModules = false
+                    }
+                })
+            } else {
+                enableShellCheck()
+                Config.checkModules = true
             }
-            return@Switch false
-        } else {
-            enableShellCheck()
-            return@Switch true
+            notifyPropertyChanged(BR.checked)
         }
-    }
-)
+}
+
 
 
 
