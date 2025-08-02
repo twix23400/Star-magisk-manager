@@ -314,28 +314,6 @@ object DenyList : BaseSettingsItem.Toggle() {
 }
 
 
-object ModuleCheckToggle : BaseSettingsItem.Toggle() {
-    override val title = "Проверка модулей на вредоносность".asText()
-    override val description = "Отключение может быть небезопасным".asText()
-    override var value: Boolean
-        get() = Config.checkModules
-        set(v) {
-            if (!v) {
-                showDangerousDisableDialog(AppContext.get(), confirmed@{ confirmed ->
-                    if (confirmed) {
-                        disableShellCheck()
-                        Config.checkModules = false
-                    }
-                })
-            } else {
-                enableShellCheck()
-                Config.checkModules = true
-            }
-            notifyPropertyChanged(BR.checked)
-        }
-}
-
-
 
 
 object DenyListConfig : BaseSettingsItem.Blank() {
